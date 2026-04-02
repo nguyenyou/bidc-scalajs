@@ -1,0 +1,6 @@
+out/
+.bsp/
+.metals/
+.idea/
+.DS_Store
+mill.bat
