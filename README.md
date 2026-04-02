@@ -12,11 +12,14 @@ A Scala.js port of [vercel/bidc](https://github.com/vercel/bidc) — bidirection
 
 ## Usage
 
+All `createChannel` methods require an implicit `ExecutionContext`.
+
 **Main thread:**
 
 ```scala
 import bidc.Bidc
 import scala.scalajs.js
+import scala.concurrent.ExecutionContext.Implicits.global
 
 val worker = new org.scalajs.dom.Worker("worker.js")
 val channel = Bidc.createChannel(worker)
@@ -32,6 +35,7 @@ channel.send(js.Dynamic.literal(value = "Hello, worker!")).foreach { response =>
 ```scala
 import bidc.Bidc
 import scala.scalajs.js
+import scala.concurrent.ExecutionContext.Implicits.global
 
 val channel = Bidc.createChannel()
 
@@ -40,6 +44,20 @@ channel.receive { data =>
   value.toUpperCase()
 }
 ```
+
+## ExecutionContext
+
+BIDC takes `ExecutionContext` as an implicit parameter so you can choose your own. The default `ExecutionContext.global` in Scala.js uses the **microtask** queue (`Promise.then()`), which can starve macrotask events like `postMessage`/`onmessage` under heavy Future chaining.
+
+For best results, use [scala-js-macrotask-executor](https://github.com/nicmart/scala-js-macrotask-executor):
+
+```scala
+import org.scalajs.macrotaskexecutor.MacrotaskExecutor.Implicits._
+
+val channel = Bidc.createChannel(worker) // uses macrotask EC
+```
+
+This schedules Future callbacks on the **macrotask** queue (via `setImmediate` polyfill), which naturally aligns with `postMessage` — the transport BIDC uses internally. This prevents UI/IO starvation and ensures fair interleaving of channel messages with other async work.
 
 ## Build
 

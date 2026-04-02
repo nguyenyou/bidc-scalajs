@@ -3,8 +3,8 @@ package bidc
 import scala.scalajs.js
 import scala.scalajs.js.annotation.*
 import scala.scalajs.js.JSConverters.*
-import scala.concurrent.{Future, Promise as ScalaPromise}
-import scala.concurrent.ExecutionContext.Implicits.global
+import scala.scalajs.js.Thenable.Implicits.*
+import scala.concurrent.{ExecutionContext, Future, Promise as ScalaPromise}
 import scala.collection.mutable
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -16,19 +16,19 @@ import scala.collection.mutable
 object Bidc:
 
   /** Create a channel to the parent context (window.parent or worker self). */
-  def createChannel(): Channel =
+  def createChannel()(using ExecutionContext): Channel =
     new ChannelImpl(None, "default")
 
   /** Create a channel to a target (Worker, Window, MessagePort, etc.). */
-  def createChannel(target: js.Any): Channel =
+  def createChannel(target: js.Any)(using ExecutionContext): Channel =
     new ChannelImpl(Some(target), "default")
 
   /** Create a namespaced channel to a target. */
-  def createChannel(target: js.Any, channelId: String): Channel =
+  def createChannel(target: js.Any, channelId: String)(using ExecutionContext): Channel =
     new ChannelImpl(Some(target), channelId)
 
   /** Create a namespaced channel to the parent context. */
-  def createChannelWithId(channelId: String): Channel =
+  def createChannelWithId(channelId: String)(using ExecutionContext): Channel =
     new ChannelImpl(None, channelId)
 
 trait Channel:
@@ -58,7 +58,7 @@ private object Serializer:
   def parse(
       text: String,
       resolvers: mutable.Map[String, PromiseResolver]
-  ): js.Any =
+  )(using ExecutionContext): js.Any =
     restoreSpecial(js.JSON.parse(text), resolvers)
 
   // -- helpers --
@@ -100,7 +100,7 @@ private object Serializer:
   private def restoreSpecial(
       value: js.Any,
       resolvers: mutable.Map[String, PromiseResolver]
-  ): js.Any =
+  )(using ExecutionContext): js.Any =
     if value == null || js.isUndefined(value) then value
     else if js.Array.isArray(value) then
       value
@@ -143,8 +143,9 @@ end Serializer
 // ── Promise bookkeeping ─────────────────────────────────────────────
 
 private class PromiseCollector:
-  // Use JS Map via Dynamic for identity-based key comparison on JS objects
-  private val ids = js.Dynamic.newInstance(js.Dynamic.global.Map)()
+  // js.Map for identity-based key comparison on JS objects
+  // get/set/has are on the Raw trait which is private[js], so we use Dynamic
+  private val ids = new js.Map[js.Any, String]().asInstanceOf[js.Dynamic]
   private val futures = mutable.Map.empty[String, Future[js.Any]]
   private var nextId = 0
 
@@ -156,7 +157,7 @@ private class PromiseCollector:
       val id = nextId.toString
       nextId += 1
       ids.set(key, id)
-      futures(id) = Helpers.thenableToFuture(thenable)
+      futures(id) = thenable.toFuture
       id
 
   def pendingExcluding(resolved: Set[String]): Map[String, Future[js.Any]] =
@@ -164,18 +165,16 @@ private class PromiseCollector:
 
 end PromiseCollector
 
-private class PromiseResolver:
+private class PromiseResolver(using ec: ExecutionContext):
   private val underlying = ScalaPromise[js.Any]()
   val future: Future[js.Any] = underlying.future
   val jsPromise: js.Promise[js.Any] = new js.Promise[js.Any](
     (resolve, reject) =>
-      future.foreach(v => resolve(v))
-      future.failed.foreach(e =>
-        reject(e match
-          case jse: scala.scalajs.js.JavaScriptException => jse.exception
-          case other => other.getMessage
-        )
-      )
+      future.onComplete {
+        case scala.util.Success(v) => resolve(v)
+        case scala.util.Failure(e) =>
+          reject(js.special.unwrapFromThrowable(e))
+      }
   )
 
   def resolve(value: js.Any): Unit =
@@ -191,7 +190,7 @@ private object Protocol:
   /** Encode a value into streaming chunks. Calls `onChunk` synchronously for
     * the first chunk and asynchronously as nested promises resolve.
     */
-  def encode(value: js.Any, onChunk: String => Unit): Future[Unit] =
+  def encode(value: js.Any, onChunk: String => Unit)(using ExecutionContext): Future[Unit] =
     val collector = new PromiseCollector
     val serialized = Serializer.stringify(value, collector)
     onChunk(s"r:$serialized")
@@ -202,7 +201,7 @@ private object Protocol:
       collector: PromiseCollector,
       resolved: mutable.Set[String],
       onChunk: String => Unit
-  ): Future[Unit] =
+  )(using ExecutionContext): Future[Unit] =
     val pending = collector.pendingExcluding(resolved.toSet)
     if pending.isEmpty then Future.unit
     else
@@ -221,7 +220,10 @@ private object Protocol:
             val serialized = Serializer.stringify(value, collector)
             onChunk(s"p$id:$serialized")
           case Left(error) =>
-            val msg = Option(error.getMessage).getOrElse(error.toString)
+            val jsErr = js.special.unwrapFromThrowable(error)
+            val msg = jsErr match
+              case s: String => s
+              case _         => Option(error.getMessage).getOrElse(error.toString)
             onChunk(s"e$id:${js.JSON.stringify(msg)}")
         drain(collector, resolved, onChunk)
       }
@@ -229,7 +231,7 @@ private object Protocol:
   /** Stateful decoder that processes incoming chunks and resolves promise
     * placeholders.
     */
-  class Decoder:
+  class Decoder(using ExecutionContext):
     private val resolvers = mutable.Map.empty[String, PromiseResolver]
 
     /** Process one chunk.  Returns `Some(value)` for the initial `r:` chunk. */
@@ -247,7 +249,9 @@ private object Protocol:
         val id = chunk.substring(1, ci)
         val raw = js.JSON.parse(chunk.substring(ci + 1))
         val msg = if raw == null then "unknown error" else raw.toString
-        resolvers.get(id).foreach(_.reject(new Exception(msg)))
+        resolvers.get(id).foreach(_.reject(
+          js.special.wrapAsThrowable(msg)
+        ))
         None
       else None
 
@@ -258,7 +262,7 @@ end Protocol
 private class ChannelImpl(
     maybeTarget: Option[js.Any],
     channelId: String
-) extends Channel:
+)(using ExecutionContext) extends Channel:
 
   private val namespace = s"bidc_$channelId"
   private val responses = mutable.Map.empty[String, ScalaPromise[js.Any]]
@@ -281,6 +285,8 @@ private class ChannelImpl(
       val msgId = generateId()
       Protocol.encode(data, chunk =>
         port.asInstanceOf[js.Dynamic].postMessage(s"$msgId@$chunk")
+      ).failed.foreach(e =>
+        js.Dynamic.global.console.error("bidc: streaming error", e.getMessage)
       )
       val resolver = ScalaPromise[js.Any]()
       responses(msgId) = resolver
@@ -302,47 +308,48 @@ private class ChannelImpl(
       val msgId = generateId()
       Protocol.encode(data, chunk =>
         port.asInstanceOf[js.Dynamic].postMessage(s"$msgId@$chunk")
+      ).failed.foreach(e =>
+        js.Dynamic.global.console.error("bidc: streaming error", e.getMessage)
       )
     }
 
   // ── internal: message handling ──
 
   private def setupMessageHandler(port: js.Any): Unit =
-    if canceled then return
+    if !canceled then
+      var activePort = port
+      val handler: js.Function1[js.Dynamic, Unit] = (event: js.Dynamic) =>
+        val raw = event.data
+        if js.typeOf(raw) == "string" then
+          val rawStr = raw.asInstanceOf[String]
+          val atIdx = rawStr.indexOf('@')
+          if atIdx > 0 then
+            val msgId = rawStr.substring(0, atIdx)
+            val chunk = rawStr.substring(atIdx + 1)
+            if chunk.startsWith("r:") then
+              val decoder = new Protocol.Decoder
+              decodings(msgId) = decoder
+              decoder.processChunk(chunk).foreach(decoded =>
+                handleDecoded(msgId, decoded)
+              )
+            else
+              decodings.get(msgId).foreach(_.processChunk(chunk))
 
-    var activePort = port
-    val handler: js.Function1[js.Dynamic, Unit] = (event: js.Dynamic) =>
-      val raw = event.data
-      if js.typeOf(raw) == "string" then
-        val rawStr = raw.asInstanceOf[String]
-        val atIdx = rawStr.indexOf('@')
-        if atIdx > 0 then
-          val msgId = rawStr.substring(0, atIdx)
-          val chunk = rawStr.substring(atIdx + 1)
-          if chunk.startsWith("r:") then
-            val decoder = new Protocol.Decoder
-            decodings(msgId) = decoder
-            decoder.processChunk(chunk).foreach(decoded =>
-              handleDecoded(msgId, decoded)
-            )
-          else
-            decodings.get(msgId).foreach(_.processChunk(chunk))
+      activePort.asInstanceOf[js.Dynamic].addEventListener("message", handler)
+      activePort.asInstanceOf[js.Dynamic].start()
+      disposables += (() =>
+        activePort.asInstanceOf[js.Dynamic].removeEventListener("message", handler)
+      )
 
-    activePort.asInstanceOf[js.Dynamic].addEventListener("message", handler)
-    activePort.asInstanceOf[js.Dynamic].start()
-    disposables += (() =>
-      activePort.asInstanceOf[js.Dynamic].removeEventListener("message", handler)
-    )
-
-    onResetPortCallbacks += { (newPort: js.Any) =>
-      if !canceled then
-        activePort
-          .asInstanceOf[js.Dynamic]
-          .removeEventListener("message", handler)
-        activePort = newPort
-        activePort.asInstanceOf[js.Dynamic].addEventListener("message", handler)
-        activePort.asInstanceOf[js.Dynamic].start()
-    }
+      onResetPortCallbacks += { (newPort: js.Any) =>
+        if !canceled then
+          activePort
+            .asInstanceOf[js.Dynamic]
+            .removeEventListener("message", handler)
+          activePort = newPort
+          activePort.asInstanceOf[js.Dynamic].addEventListener("message", handler)
+          activePort.asInstanceOf[js.Dynamic].start()
+      }
 
   private def handleDecoded(msgId: String, decoded: js.Any): Unit =
     val dyn = decoded.asInstanceOf[js.Dynamic]
@@ -503,19 +510,3 @@ private class ChannelImpl(
 
 end ChannelImpl
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-private object Helpers:
-  def thenableToFuture(t: js.Thenable[js.Any]): Future[js.Any] =
-    val p = ScalaPromise[js.Any]()
-    t.`then`[Unit](
-      ((v: js.Any) => { p.success(v); () }): js.Function1[js.Any, Unit],
-      js.defined(((e: scala.Any) => {
-        val err = e match
-          case t: Throwable => t
-          case _            => js.JavaScriptException(e.asInstanceOf[js.Any])
-        p.failure(err)
-        ()
-      }): js.Function1[scala.Any, Unit])
-    )
-    p.future
